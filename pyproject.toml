@@ -10,10 +10,9 @@ readme = "README.md"
 authors = [
     {name = "Sarthak Siddha", email = "your.email@example.com"}
 ]
-license = {text = "MIT"}
+license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 requires-python = ">=3.8"
@@ -36,6 +35,9 @@ dev = [
 [project.urls]
 "Homepage" = "https://github.com/sarthaksiddha/wireshark-mcp"
 "Bug Tracker" = "https://github.com/sarthaksiddha/wireshark-mcp/issues"
+
+[tool.setuptools.packages.find]
+include = ["wireshark_mcp*", "web_interface*"]
 
 [tool.black]
 line-length = 88

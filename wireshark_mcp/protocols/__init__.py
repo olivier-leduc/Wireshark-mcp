@@ -16,6 +16,7 @@ class Protocol(Enum):
     ICMP = "ICMP"
     DHCP = "DHCP"
     ARP = "ARP"
+    BGP = "BGP"
     FTP = "FTP"
     SMTP = "SMTP"
     SSH = "SSH"
@@ -35,6 +36,8 @@ from .http import HTTPProtocolAnalyzer
 from .dns import DNSProtocolAnalyzer
 from .smtp import SMTPProtocolAnalyzer
 from .tls import TLSProtocolAnalyzer
+from .arp import ARPProtocolAnalyzer
+from .bgp import BGPProtocolAnalyzer
 
 # Registry of protocol analyzers
 _PROTOCOL_ANALYZERS: Dict[Protocol, Type[BaseProtocolAnalyzer]] = {
@@ -42,8 +45,25 @@ _PROTOCOL_ANALYZERS: Dict[Protocol, Type[BaseProtocolAnalyzer]] = {
     Protocol.DNS: DNSProtocolAnalyzer,
     Protocol.SMTP: SMTPProtocolAnalyzer,
     Protocol.TLS: TLSProtocolAnalyzer,
-    # Add more protocol analyzers as they are implemented
+    Protocol.ARP: ARPProtocolAnalyzer,
+    Protocol.BGP: BGPProtocolAnalyzer,
 }
+
+def coerce_protocol(protocol: Any) -> Protocol:
+    """Normalize str/Enum values to this module's Protocol enum."""
+    if isinstance(protocol, Protocol):
+        return protocol
+    name = getattr(protocol, "name", None)
+    if isinstance(name, str) and name in Protocol.__members__:
+        return Protocol[name]
+    value = getattr(protocol, "value", protocol)
+    if isinstance(value, str):
+        upper = value.upper()
+        if upper in Protocol.__members__:
+            return Protocol[upper]
+        return Protocol(value)
+    raise ValueError(f"Unknown protocol: {protocol!r}")
+
 
 def get_protocol_analyzer(protocol: Protocol) -> Type[BaseProtocolAnalyzer]:
     """

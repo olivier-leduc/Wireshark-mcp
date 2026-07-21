@@ -10,7 +10,7 @@ import tempfile
 from typing import List, Dict, Any, Optional, Union
 import logging
 
-from .protocols import Protocol, get_protocol_analyzer
+from .protocols import Protocol, get_protocol_analyzer, coerce_protocol
 from .filter import Filter
 from .extractors import TsharkExtractor
 
@@ -70,8 +70,7 @@ class WiresharkMCP:
     
     def _get_protocol_analyzer(self, protocol: Union[str, Protocol]):
         """Get the appropriate protocol analyzer instance."""
-        if isinstance(protocol, str):
-            protocol = Protocol(protocol)
+        protocol = coerce_protocol(protocol)
             
         if protocol not in self._protocol_analyzers:
             analyzer_class = get_protocol_analyzer(protocol)
@@ -84,7 +83,8 @@ class WiresharkMCP:
                         filter: Optional[Filter] = None,
                         include_headers: bool = True,
                         include_body: bool = False,
-                        max_conversations: int = 10) -> Dict[str, Any]:
+                        max_conversations: int = 10,
+                        max_packets: Optional[int] = None) -> Dict[str, Any]:
         """
         Extract and analyze packets for a specific protocol.
         
@@ -94,18 +94,27 @@ class WiresharkMCP:
             include_headers: Whether to include protocol headers
             include_body: Whether to include message bodies
             max_conversations: Maximum number of conversations to include
+            max_packets: Maximum packets to extract (defaults to max_conversations * 50)
             
         Returns:
             Dictionary containing analyzed protocol data
         """
-        protocol_obj = protocol if isinstance(protocol, Protocol) else Protocol(protocol)
+        protocol_obj = coerce_protocol(protocol)
         filter_str = str(filter) if filter else f"{protocol_obj.value.lower()}"
-        
-        packets = self.extractor.extract_packets(
-            self.pcap_path, 
-            filter_str, 
-            max_packets=max_conversations * 10  # Extract more than needed to find full conversations
-        )
+        packet_limit = max_packets if max_packets is not None else max(max_conversations * 50, 500)
+
+        # Prefer tshark -T fields for ARP/BGP: more reliable message decoding
+        # than -Y <proto> -T json on some Wireshark builds / encapsulations.
+        if protocol_obj == Protocol.ARP:
+            packets = self._extract_arp_via_fields(packet_limit)
+        elif protocol_obj == Protocol.BGP:
+            packets = self._extract_bgp_via_fields(packet_limit)
+        else:
+            packets = self.extractor.extract_packets(
+                self.pcap_path,
+                filter_str,
+                max_packets=packet_limit
+            )
         
         analyzer = self._get_protocol_analyzer(protocol_obj)
         features = analyzer.extract_features(
@@ -120,6 +129,139 @@ class WiresharkMCP:
         )
         
         return context
+
+    def _extract_arp_via_fields(self, max_packets: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Extract ARP packets using tshark -T fields (reliable for VXLAN-encapsulated ARP)."""
+        command = [
+            self.tshark_path,
+            "-r", self.pcap_path,
+            "-Y", "arp",
+            "-T", "fields",
+            "-E", "separator=\t",
+            "-e", "frame.time_epoch",
+            "-e", "arp.opcode",
+            "-e", "arp.src.hw_mac",
+            "-e", "arp.src.proto_ipv4",
+            "-e", "arp.dst.hw_mac",
+            "-e", "arp.dst.proto_ipv4",
+        ]
+        if max_packets is not None:
+            command.extend(["-c", str(max_packets)])
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+        )
+        packets: List[Dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 6:
+                continue
+            ts, opcode, sender_mac, sender_ip, target_mac, target_ip = parts[:6]
+            opcode_name = {"1": "request", "2": "reply"}.get(opcode, f"unknown({opcode})")
+            try:
+                timestamp = float(ts) if ts else None
+            except ValueError:
+                timestamp = None
+            packets.append({
+                "timestamp": timestamp,
+                "layers": [{"name": "arp", "protocol": "ARP"}],
+                "arp": {
+                    "protocol": "ARP",
+                    "opcode": opcode,
+                    "opcode_name": opcode_name,
+                    "sender_mac": sender_mac,
+                    "sender_ip": sender_ip,
+                    "target_mac": target_mac,
+                    "target_ip": target_ip,
+                },
+            })
+        return packets
+
+    def _extract_bgp_via_fields(self, max_packets: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Extract BGP messages using tshark -T fields."""
+        command = [
+            self.tshark_path,
+            "-r", self.pcap_path,
+            "-Y", "bgp",
+            "-T", "fields",
+            "-E", "separator=\t",
+            "-e", "frame.time_epoch",
+            "-e", "ip.src",
+            "-e", "ip.dst",
+            "-e", "tcp.srcport",
+            "-e", "tcp.dstport",
+            "-e", "bgp.type",
+            "-e", "bgp.open.version",
+            "-e", "bgp.open.myas",
+            "-e", "bgp.open.holdtime",
+            "-e", "bgp.open.identifier",
+            "-e", "bgp.notify.major_error",
+            "-e", "bgp.notify.minor_error",
+            "-e", "bgp.notify.minor_error_open",
+            "-e", "bgp.notify.minor_error_cease",
+            "-e", "bgp.notify.communication",
+            "-e", "bgp.nlri_prefix",
+            "-e", "bgp.withdrawn_prefix",
+            "-e", "bgp.update.path_attribute.next_hop",
+        ]
+        if max_packets is not None:
+            command.extend(["-c", str(max_packets)])
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+        )
+        packets: List[Dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            while len(parts) < 18:
+                parts.append("")
+            (
+                ts, src, dst, sport, dport, btype,
+                open_ver, open_as, open_hold, open_id,
+                maj, minor, minor_open, minor_cease, communication,
+                nlri, withdrawn, next_hop,
+            ) = parts[:18]
+            try:
+                timestamp = float(ts) if ts else None
+            except ValueError:
+                timestamp = None
+            types = [t.strip() for t in btype.split(",") if t.strip()]
+            packets.append({
+                "timestamp": timestamp,
+                "layers": [{"name": "bgp", "protocol": "BGP"}],
+                "ip": {"src": src, "dst": dst},
+                "tcp": {"srcport": sport, "dstport": dport},
+                "bgp": {
+                    "protocol": "BGP",
+                    "type": btype,
+                    "types": types,
+                    "src_ip": src,
+                    "dst_ip": dst,
+                    "src_port": sport,
+                    "dst_port": dport,
+                    "open_version": open_ver,
+                    "open_my_as": open_as,
+                    "open_hold_time": open_hold,
+                    "open_identifier": open_id,
+                    "notify_major": maj,
+                    "notify_minor": minor or minor_open or minor_cease,
+                    "notify_minor_open": minor_open,
+                    "notify_minor_cease": minor_cease,
+                    "notify_communication": communication,
+                    "nlri_prefix": nlri,
+                    "withdrawn_prefix": withdrawn,
+                    "next_hop": next_hop,
+                },
+            })
+        return packets
     
     def generate_context(self,
                         max_packets: int = 100,
@@ -157,11 +299,16 @@ class WiresharkMCP:
         # Add focused protocol details
         if focus_protocols:
             for protocol in focus_protocols:
-                proto_obj = protocol if isinstance(protocol, Protocol) else Protocol(protocol)
+                proto_obj = coerce_protocol(protocol)
                 try:
                     proto_context = self.extract_protocol(
                         proto_obj,
-                        max_conversations=5  # Limited for the general context
+                        max_conversations=20,
+                        max_packets=(
+                            max(max_packets, 5000)
+                            if proto_obj in (Protocol.ARP, Protocol.BGP)
+                            else max_packets
+                        ),
                     )
                     context["protocol_data"][proto_obj.value] = proto_context
                 except Exception as e:
@@ -283,11 +430,19 @@ class WiresharkMCP:
         """Calculate the duration of the packet capture in seconds."""
         if not packets:
             return 0.0
-            
-        start_time = float(packets[0].get('timestamp', 0))
-        end_time = float(packets[-1].get('timestamp', 0))
-        
-        return end_time - start_time
+
+        def _as_float(value: Any) -> float:
+            if value is None or value == "":
+                return 0.0
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        start_time = _as_float(packets[0].get('timestamp', 0))
+        end_time = _as_float(packets[-1].get('timestamp', 0))
+
+        return max(0.0, end_time - start_time)
     
     def _identify_protocols(self, packets: List[Dict[str, Any]]) -> Dict[str, int]:
         """Identify protocols and their frequency in the packet capture."""
